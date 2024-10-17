@@ -1,0 +1,139 @@
+name: Build Preview APK for PR
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+env:
+  APP_ENV": "${{ secrets.APP_ENV }}"
+  FILE_NAME": "${{ secrets.FILE_NAME }}"
+      
+jobs:
+  build:
+    name: 🏗 Setup repo
+    if: github.event.commits[0].author.name != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔎 Check EXPO_TOKEN
+        run: |
+          if [ -z "${{ secrets.EXPO_TOKEN }}" ]; then
+            echo "EXPO_TOKEN not found must be configured within github"
+            exit 1
+          fi
+        
+      - name: 🏗 Setup repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: 🤖 Set git bot
+        id: git-bot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr checkout ${{ github.event.pull_request.number }}
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+
+      - name: 💡 Set Google Services
+        run: |
+          echo "${{ secrets.GOOGLE_SERVICES }}" | base64 --decode > ./google-services.json
+          echo "${{ secrets.GOOGLE_SERVICES_INFO }}" | base64 --decode > ./GoogleService-Info.plist
+
+
+      - name: 🔍 Check google-services.json and GoogleService-Info.plist
+        run: |
+          if [ ! -f "google-services.json" ]; then
+            echo "google-services.json not found in the project root"
+            exit 1
+          fi
+          if [ ! -f "GoogleService-Info.plist" ]; then
+            echo "GoogleService-Info.plist not found in the project root"
+            exit 1
+          fi
+
+      - name: 🏗 Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20.x
+          cache: yarn
+
+
+      - name: 🏗 Setup JAVA JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: 🏗 Setup Android SDK
+        uses: android-actions/setup-android@v3 #default is version 10406996 (short version 11.0)
+
+      - name: 🔢 Calculate version code
+        id: version_code
+        run: |
+          COMMIT_COUNT=$(git log --oneline --all | wc -l)
+          jq --argjson vc "${COMMIT_COUNT}" '.versionCode = $vc' version.json > tmp.json && mv tmp.json version.json
+          VERSION=$(jq -r .version version.json)
+          VERSION_CODE=$(jq -r .versionCode version.json)
+          FILE_NAME="${VERSION}_${VERSION_CODE}.apk"
+          echo "VERSION_CODE=${VERSION_CODE}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "FILE_NAME=${FILE_NAME}" >> $GITHUB_ENV
+          echo "Current Build ${VERSION} and Version Code ${VERSION_CODE}"
+
+      - name: 🏗 Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: 📦 Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: ⚙️ Build APK
+        id: build_apk
+        env:
+          EAS_BUILD_PROFILE: preview
+        run: |
+          eas build --local --platform android --profile preview --output=./${{ env.FILE_NAME }}
+
+      - name: ✅ Check build result
+        if: success()
+        run: echo "Build successful 🎉"
+
+
+      - name: 🔍 Check PR status
+        id: check_pr_status
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_STATE=$(gh pr view ${{ github.event.pull_request.number }} --json state -q .state)
+          if [ "$PR_STATE" != "OPEN" ]; then
+            echo "PR #${{ github.event.pull_request.number }} não esta mais aberta."
+            exit 1
+          fi
+
+      - name: 📝 Update versionCode in project and PR
+        run: |
+          git add version.json
+          git commit -m "Bump versionCode Build Number ${{ env.VERSION_CODE }} and current version $(jq -r .version version.json)"
+          git push
+
+      - name: ✍ Create release
+        id: create_release
+        if: success()
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.VERSION }}_${{ env.VERSION_CODE }}"
+          name: "Release ${{ env.VERSION }}_${{ env.VERSION_CODE }}"
+          draft: false
+          prerelease: true
+          artifacts: ${{ env.FILE_NAME }}
+
+      - name: 🤖 Comment on PR
+        uses: thollander/actions-comment-pull-request@v3
+        with:
+          message: |
+            ✅ APK version ${{ env.VERSION }}_${{ env.VERSION_CODE }} generated successfully!
